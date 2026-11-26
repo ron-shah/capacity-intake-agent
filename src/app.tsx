@@ -90,6 +90,9 @@ const CAPACITY_TOOLS = new Set([
   "calculateResources",
   "calculateCapex",
   "applyGiveBack",
+  "validateSplit",
+  "lookupRequest",
+  "reuseRequestDetails",
   "buildSummary",
   "submitRequest"
 ]);
@@ -137,6 +140,7 @@ function ToolPartView({
   if ("approval" in part && part.state === "approval-requested") {
     const approvalId = (part.approval as { id?: string })?.id;
     const isSubmit = toolName === "submitRequest";
+    const isReuse = toolName === "reuseRequestDetails";
     return (
       <div className="flex justify-start">
         <Surface className="max-w-[85%] px-4 py-3 rounded-xl ring-2 ring-kumo-warning">
@@ -145,10 +149,19 @@ function ToolPartView({
             <Text size="sm" bold>
               {isSubmit
                 ? "Submit this capacity request?"
-                : `Approval needed: ${toolName}`}
+                : isReuse
+                  ? "Reuse these details?"
+                  : `Approval needed: ${toolName}`}
             </Text>
           </div>
-          {isSubmit ? (
+          {isReuse ? (
+            <div className="mb-3">
+              <Text size="xs" variant="secondary">
+                Approve to reuse the App name, App ID, Business Unit, Requester
+                and MD approver shown above. Reject to enter them yourself.
+              </Text>
+            </div>
+          ) : isSubmit ? (
             <div className="mb-3">
               <Text size="xs" variant="secondary">
                 Review the summary above. Approve saves the request and issues a
@@ -217,6 +230,23 @@ function ToolPartView({
   // Errored
   if (part.state === "output-error") {
     const errorText = part.errorText;
+    // Capacity tools: the chat always follows up with a plain question or a
+    // friendly message, so show a neutral note instead of a red error card.
+    if (!showIO) {
+      return (
+        <div className="flex justify-start">
+          <Surface className="max-w-[85%] px-4 py-2.5 rounded-xl ring ring-kumo-line">
+            <div className="flex items-center gap-2">
+              <GearIcon size={14} className="text-kumo-inactive" />
+              <Text size="xs" variant="secondary" bold>
+                {toolName}
+              </Text>
+              <Badge variant="secondary">Didn't go through</Badge>
+            </div>
+          </Surface>
+        </div>
+      );
+    }
     return (
       <div className="flex justify-start">
         <Surface className="max-w-[85%] px-4 py-2.5 rounded-xl ring-2 ring-kumo-danger">
