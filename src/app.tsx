@@ -83,18 +83,32 @@ function ToolIO({ label, value }: { label: string; value: unknown }) {
   );
 }
 
+// Capacity tools show their results as formatted chat text (written by the
+// server), so their raw JSON is only shown in debug mode.
+const CAPACITY_TOOLS = new Set([
+  "listDataCenters",
+  "calculateResources",
+  "calculateCapex",
+  "applyGiveBack",
+  "buildSummary",
+  "submitRequest"
+]);
+
 function ToolPartView({
   part,
-  addToolApprovalResponse
+  addToolApprovalResponse,
+  showDebug
 }: {
   part: UIMessage["parts"][number];
   addToolApprovalResponse: (response: {
     id: string;
     approved: boolean;
   }) => void;
+  showDebug: boolean;
 }) {
   if (!isToolUIPart(part)) return null;
   const toolName = getToolName(part);
+  const showIO = showDebug || !CAPACITY_TOOLS.has(toolName);
 
   // Completed
   if (part.state === "output-available") {
@@ -108,8 +122,12 @@ function ToolPartView({
             </Text>
             <Badge variant="secondary">Done</Badge>
           </div>
-          <ToolIO label="Input" value={part.input} />
-          <ToolIO label="Output" value={part.output} />
+          {showIO && (
+            <>
+              <ToolIO label="Input" value={part.input} />
+              <ToolIO label="Output" value={part.output} />
+            </>
+          )}
         </Surface>
       </div>
     );
@@ -118,20 +136,32 @@ function ToolPartView({
   // Needs approval
   if ("approval" in part && part.state === "approval-requested") {
     const approvalId = (part.approval as { id?: string })?.id;
+    const isSubmit = toolName === "submitRequest";
     return (
       <div className="flex justify-start">
         <Surface className="max-w-[85%] px-4 py-3 rounded-xl ring-2 ring-kumo-warning">
           <div className="flex items-center gap-2 mb-2">
             <GearIcon size={14} className="text-kumo-warning" />
             <Text size="sm" bold>
-              Approval needed: {toolName}
+              {isSubmit
+                ? "Submit this capacity request?"
+                : `Approval needed: ${toolName}`}
             </Text>
           </div>
-          <div className="font-mono mb-3">
-            <Text size="xs" variant="secondary">
-              {JSON.stringify(part.input, null, 2)}
-            </Text>
-          </div>
+          {isSubmit ? (
+            <div className="mb-3">
+              <Text size="xs" variant="secondary">
+                Review the summary above. Approve saves the request and issues a
+                CAP request ID. Reject lets you make changes first.
+              </Text>
+            </div>
+          ) : (
+            <div className="font-mono mb-3">
+              <Text size="xs" variant="secondary">
+                {JSON.stringify(part.input, null, 2)}
+              </Text>
+            </div>
+          )}
           <div className="flex gap-2">
             <Button
               variant="primary"
@@ -218,7 +248,7 @@ function ToolPartView({
               Running {toolName}...
             </Text>
           </div>
-          <ToolIO label="Input" value={part.input} />
+          {showIO && <ToolIO label="Input" value={part.input} />}
         </Surface>
       </div>
     );
@@ -603,6 +633,7 @@ function Chat() {
                         key={key}
                         part={part}
                         addToolApprovalResponse={addToolApprovalResponse}
+                        showDebug={showDebug}
                       />
                     );
                   }

@@ -1,16 +1,14 @@
 import { callable, routeAgentRequest } from "agents";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
-import {
-  convertToModelMessages,
-  pruneMessages,
-  stepCountIs,
-  streamText
-} from "ai";
+import { convertToModelMessages, pruneMessages, streamText } from "ai";
 import { formatRequestId } from "./capacity";
 import {
   SYSTEM_PROMPT,
+  capacityPrepareStep,
+  capacityStopWhen,
   createCapacityTools,
   createModel,
+  displayTransform,
   type Conversation,
   type Draft,
   type DraftStore
@@ -24,11 +22,16 @@ export class ChatAgent extends AIChatAgent<Env> {
   waitForMcpConnections = true;
 
   onStart() {
-    this.sql`CREATE TABLE IF NOT EXISTS capacity_requests (
+    // Submitted requests. (Table names differ from earlier drafts of this
+    // agent so a stale local dev database can't clash with the new columns.)
+    this.sql`CREATE TABLE IF NOT EXISTS cap_requests (
       seq INTEGER PRIMARY KEY,
       request_id TEXT NOT NULL UNIQUE,
       app_name TEXT NOT NULL,
-      owner TEXT NOT NULL,
+      app_id TEXT NOT NULL,
+      business_unit TEXT NOT NULL,
+      requester TEXT NOT NULL,
+      md_approver TEXT NOT NULL,
       environment TEXT NOT NULL,
       region TEXT NOT NULL,
       data_center TEXT NOT NULL,
@@ -39,18 +42,15 @@ export class ChatAgent extends AIChatAgent<Env> {
       net_cores INTEGER NOT NULL,
       capex_before REAL NOT NULL,
       capex_after REAL NOT NULL,
+      savings REAL NOT NULL,
       currency TEXT NOT NULL,
       created_at TEXT NOT NULL
     )`;
-    // In-progress calculation results (single row). submitRequest saves
-    // these numbers rather than anything the model passes in.
-    this.sql`CREATE TABLE IF NOT EXISTS intake_draft (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      total_cores INTEGER NOT NULL,
-      total_memory_gb REAL NOT NULL,
-      total_disk_tb REAL NOT NULL,
-      give_back_cores INTEGER,
-      give_back_turn INTEGER
+    // In-progress draft (calculated numbers + validated details) as JSON.
+    // submitRequest saves these values rather than anything the model passes.
+    this.sql`CREATE TABLE IF NOT EXISTS intake_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     )`;
 
     // Configure OAuth popup behavior for MCP servers that require authentication
@@ -83,51 +83,35 @@ export class ChatAgent extends AIChatAgent<Env> {
   private draftStore(): DraftStore {
     return {
       get: () => {
-        const [row] = this.sql<{
-          total_cores: number;
-          total_memory_gb: number;
-          total_disk_tb: number;
-          give_back_cores: number | null;
-          give_back_turn: number | null;
-        }>`SELECT total_cores, total_memory_gb, total_disk_tb, give_back_cores,
-                  give_back_turn
-           FROM intake_draft WHERE id = 1`;
-        if (!row) return null;
-        return {
-          totalCores: row.total_cores,
-          totalMemoryGB: row.total_memory_gb,
-          totalDiskTB: row.total_disk_tb,
-          giveBackCores: row.give_back_cores,
-          giveBackTurn: row.give_back_turn
-        } satisfies Draft;
+        const [row] = this.sql<{ value: string }>`
+          SELECT value FROM intake_state WHERE key = 'draft'`;
+        return row ? (JSON.parse(row.value) as Draft) : null;
       },
       set: (draft) => {
         if (!draft) {
-          this.sql`DELETE FROM intake_draft`;
+          this.sql`DELETE FROM intake_state WHERE key = 'draft'`;
           return;
         }
-        this.sql`INSERT OR REPLACE INTO intake_draft
-          (id, total_cores, total_memory_gb, total_disk_tb, give_back_cores,
-           give_back_turn)
-          VALUES (1, ${draft.totalCores}, ${draft.totalMemoryGB},
-                  ${draft.totalDiskTB}, ${draft.giveBackCores},
-                  ${draft.giveBackTurn})`;
+        this.sql`INSERT OR REPLACE INTO intake_state (key, value)
+          VALUES ('draft', ${JSON.stringify(draft)})`;
       },
-      saveRequest: (record) => {
+      saveRequest: (r) => {
         // Durable Objects are single-threaded, so MAX+1 is safe here.
         const [{ next }] = this.sql<{ next: number }>`
-          SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM capacity_requests`;
+          SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM cap_requests`;
         const requestId = formatRequestId(next);
-        this.sql`INSERT INTO capacity_requests (
-          seq, request_id, app_name, owner, environment, region, data_center,
-          total_cores, total_memory_gb, total_disk_tb, give_back_cores,
-          net_cores, capex_before, capex_after, currency, created_at
+        this.sql`INSERT INTO cap_requests (
+          seq, request_id, app_name, app_id, business_unit, requester,
+          md_approver, environment, region, data_center, total_cores,
+          total_memory_gb, total_disk_tb, give_back_cores, net_cores,
+          capex_before, capex_after, savings, currency, created_at
         ) VALUES (
-          ${next}, ${requestId}, ${record.appName}, ${record.owner},
-          ${record.environment}, ${record.region}, ${record.dataCenter},
-          ${record.totalCores}, ${record.totalMemoryGB}, ${record.totalDiskTB},
-          ${record.giveBackCores}, ${record.netCores}, ${record.capexBefore},
-          ${record.capexAfter}, ${record.currency}, ${record.createdAt}
+          ${next}, ${requestId}, ${r.appName}, ${r.appId}, ${r.businessUnit},
+          ${r.requester}, ${r.mdApprover}, ${r.environment}, ${r.region},
+          ${r.dataCenter}, ${r.totalCores}, ${r.totalMemoryGB},
+          ${r.totalDiskTB}, ${r.giveBackCores}, ${r.netCores},
+          ${r.capexBefore}, ${r.capexAfter}, ${r.savings}, ${r.currency},
+          ${new Date().toISOString()}
         )`;
         return requestId;
       }
@@ -135,16 +119,13 @@ export class ChatAgent extends AIChatAgent<Env> {
   }
 
   private conversation(): Conversation {
-    const userMessages = () => this.messages.filter((m) => m.role === "user");
-    const textOf = (m: (typeof this.messages)[number]) =>
-      m.parts.map((p) => (p.type === "text" ? p.text : "")).join("\n");
     return {
-      userTurns: () => userMessages().length,
-      userText: () => userMessages().map(textOf).join("\n"),
-      latestUserText: () => {
-        const all = userMessages();
-        return all.length ? textOf(all[all.length - 1]) : "";
-      }
+      userText: () =>
+        this.messages
+          .filter((m) => m.role === "user")
+          .flatMap((m) => m.parts)
+          .map((p) => (p.type === "text" ? p.text : ""))
+          .join("\n")
     };
   }
 
@@ -165,7 +146,9 @@ export class ChatAgent extends AIChatAgent<Env> {
         ...mcpTools,
         ...createCapacityTools(this.draftStore(), this.conversation())
       },
-      stopWhen: stepCountIs(10),
+      prepareStep: capacityPrepareStep,
+      stopWhen: capacityStopWhen,
+      experimental_transform: displayTransform,
       abortSignal: options?.abortSignal
     });
 

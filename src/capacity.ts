@@ -38,6 +38,14 @@ export function formatMoney(amount: number): string {
   return `${sign}${prefix}${trim(abs, 2)}`;
 }
 
+/** Formats numbers with thousands separators: 1600 -> "1,600". */
+export function formatNumber(n: number): string {
+  return n.toLocaleString("en-US", { maximumFractionDigits: 3 });
+}
+
+export const GIVE_BACK_QUESTION =
+  "Can you give back equivalent cores from hosts or apps you are retiring?";
+
 function isPositiveInt(n: unknown): n is number {
   return typeof n === "number" && Number.isInteger(n) && n > 0;
 }
@@ -173,10 +181,26 @@ export function capexFor(cores: number) {
   return cores * perCore;
 }
 
-export function calculateCapex(totalCores: number) {
+export function calculateCapex(totals: {
+  totalCores: number;
+  totalMemoryGB: number;
+  totalDiskTB: number;
+}) {
+  const { totalCores, totalMemoryGB, totalDiskTB } = totals;
   if (!isPositiveInt(totalCores))
     return fail("totalCores must be a whole number > 0.");
   const capex = capexFor(totalCores);
+  // Ready-to-show block; the server writes it into the chat verbatim.
+  const display = [
+    "**Capacity estimate**",
+    "",
+    `- Total cores: ${formatNumber(totalCores)}`,
+    `- Memory: ${formatNumber(totalMemoryGB)} GB`,
+    `- Disk: ${formatNumber(totalDiskTB)} TB`,
+    `- Capex: ${formatMoney(capex)} (${formatNumber(totalCores)} cores x ${formatMoney(perCore)} per core; memory and disk are not priced)`,
+    "",
+    GIVE_BACK_QUESTION
+  ].join("\n");
   return {
     ok: true as const,
     cores: totalCores,
@@ -184,7 +208,8 @@ export function calculateCapex(totalCores: number) {
     currency,
     capex,
     capexFormatted: formatMoney(capex),
-    note: "Capex is based on cores only; memory and disk are not priced."
+    display,
+    note: "The display block (with the give-back question) has already been shown to the user. Do not repeat it; wait for the user's answer."
   };
 }
 
@@ -229,7 +254,7 @@ export function applyGiveBack(input: {
     breakdown = giveBackGroups
       .map(
         (g) =>
-          `${g.hostCount} x ${g.coresPerHost} cores = ${g.hostCount * g.coresPerHost}`
+          `${formatNumber(g.hostCount)} x ${formatNumber(g.coresPerHost)} cores = ${formatNumber(g.hostCount * g.coresPerHost)}`
       )
       .join("; ");
   } else {
@@ -260,13 +285,26 @@ export function applyGiveBack(input: {
     capexBeforeFormatted: formatMoney(capexBefore),
     capexAfterFormatted: formatMoney(capexAfter),
     savingsFormatted: formatMoney(savings),
+    display: [
+      "**Give-back applied**",
+      "",
+      `- Give-back cores: ${formatNumber(effectiveGiveBack)}${breakdown ? ` (${breakdown})` : ""}`,
+      ...(capped
+        ? [
+            `- Offered ${formatNumber(rawGiveBack)} cores; capped at the requested ${formatNumber(requestedCores)}`
+          ]
+        : []),
+      `- Net cores: ${formatNumber(netCores)}`,
+      `- Capex: ${formatMoney(capexBefore)} before, ${formatMoney(capexAfter)} after, ${formatMoney(savings)} savings`,
+      "- Memory and disk stay as requested"
+    ].join("\n"),
     note: capped
       ? `Give-back of ${rawGiveBack} cores exceeds the request; capped at ${requestedCores}. Memory and disk stay as requested.`
       : "Memory and disk stay as requested."
   };
 }
 
-// ── Final request ────────────────────────────────────────────────────
+// ── Requester details & summary ──────────────────────────────────────
 
 /** Values a model may fill in instead of asking the user. */
 const PLACEHOLDERS = new Set([
@@ -312,21 +350,116 @@ export function environmentStatedByUser(
   return /\bprod(uction)?\b/i.test(withoutNonProd);
 }
 
-const CONFIRM =
-  /\b(yes|yep|yeah|confirm|confirmed|approve|approved|submit|go ahead|looks good|lgtm|correct|proceed|sounds good|ok|okay)\b/i;
-const NEGATE = /\b(no|not|don'?t|do not|wait|hold|change|cancel|wrong)\b/i;
-
-/** True when the user's latest message reads as a confirmation. */
-export function confirmedByUser(latestUserText: string) {
-  return CONFIRM.test(latestUserText) && !NEGATE.test(latestUserText);
-}
-
-export interface SubmitInput {
+export interface RequestDetails {
   appName: string;
-  owner: string;
+  appId: string;
+  businessUnit: string;
+  requester: string;
+  mdApprover: string;
   environment: "prod" | "non-prod";
   region: string;
   dataCenter: string;
+}
+
+const DETAIL_LABELS: Record<
+  Exclude<keyof RequestDetails, "environment" | "region" | "dataCenter">,
+  string
+> = {
+  appName: "App name",
+  appId: "App ID",
+  businessUnit: "Business Unit",
+  requester: "Requester (owner)",
+  mdApprover: "MD approver name"
+};
+
+/**
+ * Checks requester details: no placeholders, every free-text value must
+ * appear in something the user typed, environment must be stated by the
+ * user, and the data center must belong to the region.
+ */
+/** Maps common spellings to "prod" / "non-prod"; anything else is invalid. */
+export function normalizeEnvironment(
+  value: string
+): "prod" | "non-prod" | undefined {
+  const v = value.trim().toLowerCase();
+  if (v === "prod" || v === "production") return "prod";
+  if (/^non[\s-]?prod(uction)?$/.test(v)) return "non-prod";
+  return undefined;
+}
+
+export function validateDetails(
+  input: Omit<RequestDetails, "environment"> & { environment: string },
+  userText: string
+) {
+  const missing: string[] = [];
+  const notFromUser: string[] = [];
+  for (const [key, label] of Object.entries(DETAIL_LABELS) as [
+    keyof typeof DETAIL_LABELS,
+    string
+  ][]) {
+    const value = (input[key] ?? "").trim();
+    if (isPlaceholder(value)) missing.push(label);
+    else if (!mentionedByUser(value, userText)) notFromUser.push(label);
+  }
+  const environment = normalizeEnvironment(input.environment ?? "");
+  if (!environment) {
+    missing.push("Environment (prod or non-prod)");
+  } else if (!environmentStatedByUser(environment, userText)) {
+    notFromUser.push("Environment (prod or non-prod)");
+  }
+  if (missing.length || notFromUser.length) {
+    const parts = [
+      missing.length && `missing: ${missing.join(", ")}`,
+      notFromUser.length &&
+        `not stated by the user (do not guess): ${notFromUser.join(", ")}`
+    ].filter(Boolean);
+    const needed = [...missing, ...notFromUser];
+    return {
+      ok: false as const,
+      error: `Ask the user for these details — ${parts.join("; ")}.`,
+      // Ready-to-show question; the server writes it into the chat.
+      display: `To finish the request, please provide:\n\n${needed.map((f) => `- ${f}`).join("\n")}`,
+      needsUserInput: true as const
+    };
+  }
+
+  const region = normalizeRegion(input.region);
+  if (!region) {
+    const msg = `Unknown region "${input.region}". Valid regions: ${REGIONS.join(", ")}.`;
+    return {
+      ok: false as const,
+      error: msg,
+      display: msg,
+      needsUserInput: true as const
+    };
+  }
+  const dataCenter = input.dataCenter.trim().toUpperCase();
+  if (!regionMap[region].includes(dataCenter)) {
+    const msg = `${dataCenter} is not in ${region}. Valid data centers in ${region}: ${regionMap[region].join(", ")}. Which one should I use?`;
+    return {
+      ok: false as const,
+      error: msg,
+      display: msg,
+      needsUserInput: true as const
+    };
+  }
+
+  return {
+    ok: true as const,
+    details: {
+      appName: input.appName.trim(),
+      appId: input.appId.trim(),
+      businessUnit: input.businessUnit.trim(),
+      requester: input.requester.trim(),
+      mdApprover: input.mdApprover.trim(),
+      environment: environment as "prod" | "non-prod",
+      region,
+      dataCenter
+    } satisfies RequestDetails
+  };
+}
+
+export interface RequestNumbers {
   totalCores: number;
   totalMemoryGB: number;
   totalDiskTB: number;
@@ -334,63 +467,71 @@ export interface SubmitInput {
 }
 
 /**
- * Validates a final request and recomputes all derived values in code
- * (net cores, capex before/after) so nothing the model passes is trusted.
+ * Builds the full request record. Net cores and capex are recomputed here
+ * from the server-held numbers; nothing the model passes is trusted.
  */
-export function buildRequestRecord(input: SubmitInput) {
-  const appName = input.appName.trim();
-  const owner = input.owner.trim();
-  if (isPlaceholder(appName)) {
-    return fail("App name is missing. Ask the user for the app name.");
-  }
-  if (isPlaceholder(owner)) {
-    return fail("Owner is missing. Ask the user who owns this request.");
-  }
-  if (input.environment !== "prod" && input.environment !== "non-prod") {
-    return fail('environment must be "prod" or "non-prod".');
-  }
-  const region = normalizeRegion(input.region);
-  if (!region)
-    return fail(
-      `Unknown region "${input.region}". Valid: ${REGIONS.join(", ")}.`
-    );
-  const dataCenter = input.dataCenter.trim().toUpperCase();
-  if (!regionMap[region].includes(dataCenter)) {
-    return fail(
-      `${dataCenter} is not in ${region}. Valid data centers in ${region}: ${regionMap[region].join(", ")}.`
-    );
-  }
-  if (!isPositiveInt(input.totalCores))
+export function buildRequestRecord(
+  details: RequestDetails,
+  numbers: RequestNumbers
+) {
+  if (!isPositiveInt(numbers.totalCores))
     return fail("totalCores must be a whole number > 0.");
-  if (!isPositive(input.totalMemoryGB))
+  if (!isPositive(numbers.totalMemoryGB))
     return fail("totalMemoryGB must be > 0.");
-  if (!isPositive(input.totalDiskTB)) return fail("totalDiskTB must be > 0.");
-
+  if (!isPositive(numbers.totalDiskTB)) return fail("totalDiskTB must be > 0.");
   const gb = applyGiveBack({
-    requestedCores: input.totalCores,
-    giveBackCores: input.giveBackCores
+    requestedCores: numbers.totalCores,
+    giveBackCores: numbers.giveBackCores
   });
   if (!gb.ok) return gb;
-
   return {
     ok: true as const,
     record: {
-      appName,
-      owner,
-      environment: input.environment,
-      region,
-      dataCenter,
-      totalCores: input.totalCores,
-      totalMemoryGB: input.totalMemoryGB,
-      totalDiskTB: input.totalDiskTB,
+      ...details,
+      totalCores: numbers.totalCores,
+      totalMemoryGB: numbers.totalMemoryGB,
+      totalDiskTB: numbers.totalDiskTB,
       giveBackCores: gb.giveBackCores,
       netCores: gb.netCores,
       capexBefore: gb.capexBefore,
       capexAfter: gb.capexAfter,
-      currency,
-      createdAt: new Date().toISOString()
+      savings: gb.savings,
+      currency
     }
   };
+}
+
+export type RequestRecord = Extract<
+  ReturnType<typeof buildRequestRecord>,
+  { ok: true }
+>["record"];
+
+/** Markdown summary table, requester details first. */
+export function summaryTable(r: RequestRecord) {
+  const rows: [string, string][] = [
+    ["App name", r.appName],
+    ["App ID", r.appId],
+    ["Business Unit", r.businessUnit],
+    ["Requester", r.requester],
+    ["MD approver", r.mdApprover],
+    ["Environment", r.environment],
+    ["Region", r.region],
+    ["Data center", r.dataCenter],
+    ["Cores", formatNumber(r.totalCores)],
+    ["Memory", `${formatNumber(r.totalMemoryGB)} GB`],
+    ["Disk", `${formatNumber(r.totalDiskTB)} TB`],
+    ["Give-back cores", formatNumber(r.giveBackCores)],
+    ["Net cores", formatNumber(r.netCores)],
+    ["Capex before", formatMoney(r.capexBefore)],
+    ["Capex after", formatMoney(r.capexAfter)],
+    ["Savings", formatMoney(r.savings)]
+  ];
+  const esc = (v: string) => v.replace(/\|/g, "\\|");
+  return [
+    "| Field | Value |",
+    "| --- | --- |",
+    ...rows.map(([k, v]) => `| ${k} | ${esc(v)} |`)
+  ].join("\n");
 }
 
 export function formatRequestId(seq: number) {

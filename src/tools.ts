@@ -1,21 +1,34 @@
 /**
- * Model, system prompt and tool definitions for the capacity intake agent.
- * Kept separate from the Durable Object so they can be exercised directly.
+ * Model, system prompt, tools and stream wiring for the capacity intake
+ * agent. Kept separate from the Durable Object so they can be exercised
+ * directly.
  */
 import { createWorkersAI } from "workers-ai-provider";
-import { simulateStreamingMiddleware, tool, wrapLanguageModel } from "ai";
+import {
+  simulateStreamingMiddleware,
+  stepCountIs,
+  tool,
+  wrapLanguageModel,
+  type PrepareStepFunction,
+  type StepResult,
+  type StopCondition,
+  type ModelMessage,
+  type StreamTextTransform,
+  type ToolSet
+} from "ai";
 import { z } from "zod";
 import {
   REGIONS,
   applyGiveBack,
-  confirmedByUser,
-  environmentStatedByUser,
-  mentionedByUser,
   buildRequestRecord,
   calculateCapex,
   calculateResources,
   formatMoney,
-  listDataCenters
+  listDataCenters,
+  summaryTable,
+  validateDetails,
+  type RequestDetails,
+  type RequestRecord
 } from "./capacity";
 
 // Workers AI model (free-plan eligible, supports function calling).
@@ -38,26 +51,22 @@ export function createModel(ai: Ai, sessionAffinity?: string) {
 export const SYSTEM_PROMPT = `You are an on-prem capacity intake coordinator. You take infrastructure capacity requests for the company's OWN data centers (not public cloud).
 
 Collect, asking for missing details one or two at a time:
-1. App name
-2. Owner
-3. Environment: prod or non-prod
-4. Region: Americas, EMEA or APAC
-5. Data center within that region. Call listDataCenters with the region and data center to check it. If it is not valid, say so and list the valid ones from the tool result.
-6. The need, either:
-   - hosts x per-host spec (cores, memory GB, disk TB per host), or
-   - totals of cores, memory and disk.
-   If the user gives a host count without a per-host spec, ask for cores, memory and disk per host.
+- The need: either hosts x per-host spec (cores, memory GB, disk TB per host), or totals of cores, memory and disk. If the user gives a host count without a per-host spec, ask for cores, memory and disk per host.
+- Region (Americas, EMEA or APAC) and data center within that region. Call listDataCenters with the region and data center to check it. If it is not valid, say so and list the valid ones from the tool result.
+- Requester details, all required: App name, App ID, Business Unit, Requester (owner), MD approver name, Environment (prod or non-prod).
+
+Flow:
+1. When you have the full need, call calculateResources. The server then calculates capex and shows the user a capacity estimate block followed by the give-back question.
+2. When the user answers the give-back question, call applyGiveBack. If the give-back is a host count, first ask how many cores each returned host has. Do not assume returned hosts match the new hosts. Accept mixed groups (e.g. 20 x 12 cores and 20 x 24 cores). If there is no give-back, call applyGiveBack with giveBackCores 0.
+3. Make sure you have every requester detail, region and data center. Ask for anything missing. Never fill in "unknown" or a guess.
+4. Call buildSummary with the requester details, region and data center. The server shows the summary table and asks the user to Approve or Reject submission with buttons.
+5. If the user clicks Reject, ask what they want to change. Do not call submitRequest again until buildSummary has been called with the changes (or the user asks to submit as is).
 
 Rules:
-- Never guess or invent numbers. Never do arithmetic yourself. Every total, capex, give-back, net core and savings figure must come from a tool result.
-- Call calculateResources once you have the full need, then calculateCapex.
+- Never guess or invent numbers or details. Never do arithmetic yourself.
+- Blocks marked as already shown to the user (capacity estimate, give-back, summary, submission) are displayed by the server. Do not repeat or rewrite them.
 - Capex is based on cores only. Memory and disk are not priced.
-- After calculateCapex, show total cores, memory, disk and capex, then ask exactly: "Can you give back equivalent cores from hosts or apps you are retiring?"
-- If the give-back is a host count, ask how many cores each returned host has. Do not assume returned hosts match the new hosts. Accept mixed groups (e.g. 20 x 12 cores and 20 x 24 cores). Then call applyGiveBack. If the user has no give-back, call applyGiveBack with giveBackCores 0.
-- Then show a short markdown summary table with: Region, Data center, Cores, Memory (GB), Disk (TB), Give-back cores, Net cores, Capex before, Capex after, Savings. Ask the user to confirm.
-- Before showing the summary table, make sure the user has given app name, owner, environment (prod or non-prod), region and data center. If any are missing, ask for them first. Never fill them in with "unknown" or a guess.
-- Only call submitRequest after the user explicitly confirms the summary. Then share the request ID.
-- Use the *Formatted money values from tool results ($200K style).
+- Write numbers with thousands separators (1,600) and money in $200K style.
 - Pass numbers as JSON numbers, not strings.
 - If a tool returns ok: false, explain the error briefly and ask for what is needed.
 - Keep replies plain and short.`;
@@ -87,7 +96,7 @@ const num = () => z.preprocess(toNumber, z.number());
 const optNum = () => z.preprocess(toNumber, z.number().nullish());
 
 // ── Server-side draft ────────────────────────────────────────────────
-// The numbers that get saved come from earlier tool results held on the
+// Everything that gets saved comes from earlier tool results held on the
 // server, never from what the model passes to submitRequest.
 
 export interface Draft {
@@ -95,29 +104,21 @@ export interface Draft {
   totalMemoryGB: number;
   totalDiskTB: number;
   giveBackCores: number | null;
-  /** User-turn count when the give-back was applied (null until then). */
-  giveBackTurn: number | null;
-}
-
-/** Read-only view of the conversation, used to ground submitRequest. */
-export interface Conversation {
-  /** Number of user messages so far, including the current one. */
-  userTurns(): number;
-  /** Concatenated text of all user messages. */
-  userText(): string;
-  /** Text of the most recent user message. */
-  latestUserText(): string;
+  /** Validated details from the last buildSummary (null until built). */
+  details: RequestDetails | null;
 }
 
 export interface DraftStore {
   get(): Draft | null;
   set(draft: Draft | null): void;
-  saveRequest(
-    record: Extract<
-      ReturnType<typeof buildRequestRecord>,
-      { ok: true }
-    >["record"]
-  ): string;
+  /** Persists the record and returns its CAP-#### ID. */
+  saveRequest(record: RequestRecord): string;
+}
+
+/** Read-only view of the conversation, used to ground requester details. */
+export interface Conversation {
+  /** Concatenated text of all user messages. */
+  userText(): string;
 }
 
 const NO_DRAFT = {
@@ -125,6 +126,30 @@ const NO_DRAFT = {
   error:
     "No resource totals yet. Collect the need and call calculateResources first."
 };
+
+const NO_GIVE_BACK = {
+  ok: false as const,
+  error:
+    "Give-back not recorded yet. Ask the give-back question and call applyGiveBack (giveBackCores 0 if none)."
+};
+
+/** Current draft as a record, or an error explaining what is missing. */
+function recordFromDraft(draft: Draft | null) {
+  if (!draft) return NO_DRAFT;
+  if (draft.giveBackCores === null) return NO_GIVE_BACK;
+  if (!draft.details) {
+    return {
+      ok: false as const,
+      error: "No summary yet. Call buildSummary first."
+    };
+  }
+  return buildRequestRecord(draft.details, {
+    totalCores: draft.totalCores,
+    totalMemoryGB: draft.totalMemoryGB,
+    totalDiskTB: draft.totalDiskTB,
+    giveBackCores: draft.giveBackCores
+  });
+}
 
 export function createCapacityTools(
   store: DraftStore,
@@ -183,13 +208,13 @@ export function createCapacityTools(
           diskUnit: input.diskUnit ?? undefined
         });
         if (result.ok) {
-          // New totals invalidate any earlier give-back.
+          // New totals invalidate any earlier give-back and summary.
           store.set({
             totalCores: result.totalCores,
             totalMemoryGB: result.totalMemoryGB,
             totalDiskTB: result.totalDiskTB,
             giveBackCores: null,
-            giveBackTurn: null
+            details: null
           });
         }
         return result;
@@ -198,12 +223,12 @@ export function createCapacityTools(
 
     calculateCapex: tool({
       description:
-        "Calculate capex for the current request from its total cores (cores x per-core rate). Memory and disk are not priced. Call after calculateResources.",
+        "Calculate capex for the current request from its total cores (cores x per-core rate). Memory and disk are not priced. Runs automatically after calculateResources.",
       inputSchema: z.object({}),
       execute: async () => {
         const draft = store.get();
         if (!draft) return NO_DRAFT;
-        return calculateCapex(draft.totalCores);
+        return calculateCapex(draft);
       }
     }),
 
@@ -236,81 +261,218 @@ export function createCapacityTools(
           store.set({
             ...draft,
             giveBackCores: result.giveBackCores,
-            giveBackTurn: conversation.userTurns()
+            details: null
           });
         }
         return result;
       }
     }),
 
-    submitRequest: tool({
+    buildSummary: tool({
       description:
-        "Save the final capacity request and return a request ID. ONLY call after the user explicitly confirms the summary. Cores, memory, disk, give-back and capex are taken from the earlier calculations on the server.",
+        "Validate the requester details, region and data center and show the final summary table to the user. Call once every detail has been given by the user and the give-back is applied.",
       inputSchema: z.object({
         appName: z.string(),
-        owner: z.string(),
-        environment: z.enum(["prod", "non-prod"]),
+        appId: z.string(),
+        businessUnit: z.string(),
+        requester: z.string().describe("Requester / owner name"),
+        mdApprover: z.string().describe("MD approver name"),
+        // Plain string so a bad value gets a "please provide" reply from
+        // validateDetails instead of a schema error card in the chat.
+        environment: z.string().describe('"prod" or "non-prod"'),
         region: z.enum(REGIONS),
         dataCenter: z.string()
       }),
       execute: async (input) => {
         const draft = store.get();
         if (!draft) return NO_DRAFT;
-        if (draft.giveBackCores === null || draft.giveBackTurn === null) {
-          return {
-            ok: false as const,
-            error:
-              "Give-back not recorded yet. Call applyGiveBack first (giveBackCores 0 if none)."
-          };
-        }
-        // The user must have replied after the give-back was calculated,
-        // i.e. after seeing the summary. Blocks same-turn submits.
-        if (
-          conversation.userTurns() <= draft.giveBackTurn ||
-          !confirmedByUser(conversation.latestUserText())
-        ) {
-          return {
-            ok: false as const,
-            error:
-              "Not confirmed yet. Show the summary table and wait for the user to confirm."
-          };
-        }
-        // Owner, app name and environment must come from the user, not a guess.
-        const userText = conversation.userText();
-        const ungrounded = [
-          !mentionedByUser(input.appName, userText) && "app name",
-          !mentionedByUser(input.owner, userText) && "owner",
-          !environmentStatedByUser(input.environment, userText) &&
-            "environment (prod or non-prod)"
-        ].filter(Boolean);
-        if (ungrounded.length) {
-          return {
-            ok: false as const,
-            error: `The user has not provided: ${ungrounded.join(", ")}. Ask the user for it; do not guess.`
-          };
-        }
-        const built = buildRequestRecord({
-          ...input,
-          totalCores: draft.totalCores,
-          totalMemoryGB: draft.totalMemoryGB,
-          totalDiskTB: draft.totalDiskTB,
-          giveBackCores: draft.giveBackCores
-        });
+        if (draft.giveBackCores === null) return NO_GIVE_BACK;
+        const valid = validateDetails(input, conversation.userText());
+        if (!valid.ok) return valid;
+        const built = recordFromDraft({ ...draft, details: valid.details });
         if (!built.ok) return built;
+        store.set({ ...draft, details: valid.details });
+        return {
+          ok: true as const,
+          display: `**Summary**\n\n${summaryTable(built.record)}\n\nReview the request, then click **Approve** to submit it or **Reject** to make changes.`,
+          note: "The summary table has already been shown to the user. Now call submitRequest; the user approves it with buttons."
+        };
+      }
+    }),
+
+    submitRequest: tool({
+      description:
+        "Submit the request summarized by buildSummary. Takes no arguments. The user must approve it with the Approve / Reject buttons.",
+      inputSchema: z.object({}),
+      // Ask for approval only when there is a valid summary to approve;
+      // otherwise execute right away and return the error to the model.
+      needsApproval: async () => recordFromDraft(store.get()).ok,
+      execute: async () => {
+        const draft = store.get();
+        const built = recordFromDraft(draft);
+        if (!built.ok) return built;
+        // Re-check grounding at save time in case the transcript changed.
+        const valid = validateDetails(built.record, conversation.userText());
+        if (!valid.ok) return valid;
         const requestId = store.saveRequest(built.record);
         store.set(null);
         return {
           ok: true as const,
           requestId,
           ...built.record,
-          savings: built.record.capexBefore - built.record.capexAfter,
-          capexBeforeFormatted: formatMoney(built.record.capexBefore),
-          capexAfterFormatted: formatMoney(built.record.capexAfter),
-          savingsFormatted: formatMoney(
-            built.record.capexBefore - built.record.capexAfter
-          )
+          display: `Request **${requestId}** submitted: ${built.record.appName} (${built.record.appId}), ${built.record.dataCenter}, capex ${formatMoney(built.record.capexAfter)} after give-back. MD approver ${built.record.mdApprover} is recorded on the request.`,
+          note: "The confirmation with the request ID has already been shown to the user. Do not repeat it."
         };
       }
     })
   };
 }
+
+// ── Stream wiring ────────────────────────────────────────────────────
+
+type CapacityTools = ReturnType<typeof createCapacityTools>;
+
+type AnyStep = StepResult<ToolSet>;
+
+/** Successful (ok !== false) results of a tool in a step. */
+function okResult(step: AnyStep | undefined, toolName: keyof CapacityTools) {
+  return step?.toolResults.some(
+    (r) =>
+      r.toolName === toolName &&
+      (r.output as { ok?: boolean } | undefined)?.ok !== false
+  );
+}
+
+/** True when the latest message is a denied (rejected) submitRequest. */
+function submitJustRejected(messages: ModelMessage[]) {
+  const lastMsg = messages[messages.length - 1];
+  if (lastMsg?.role !== "tool") return false;
+  return lastMsg.content.some(
+    (p) =>
+      p.type === "tool-result" &&
+      p.toolName === "submitRequest" &&
+      p.output.type === "execution-denied"
+  );
+}
+
+/**
+ * Forces the next deterministic step: capex right after resources, and the
+ * approval-gated submit right after the summary is shown.
+ */
+export const capacityPrepareStep: PrepareStepFunction<ToolSet> = ({
+  steps,
+  messages
+}) => {
+  // After the user clicks Reject, make the model answer in text (ask what
+  // to change) instead of immediately calling submitRequest again.
+  if (steps.length === 0 && submitJustRejected(messages)) {
+    // Workers AI rejects an empty tools array, so keep one harmless tool
+    // active and disable tool calls for this step.
+    return { activeTools: ["listDataCenters"], toolChoice: "none" };
+  }
+  const last = steps[steps.length - 1];
+  if (
+    okResult(last, "calculateResources") &&
+    !okResult(last, "calculateCapex")
+  ) {
+    return { toolChoice: { type: "tool", toolName: "calculateCapex" } };
+  }
+  if (okResult(last, "buildSummary")) {
+    return { toolChoice: { type: "tool", toolName: "submitRequest" } };
+  }
+  return undefined;
+};
+
+/**
+ * Ends the turn once the server has shown the capex block (which ends with
+ * the give-back question) or the submit confirmation, so the model does not
+ * talk over them.
+ */
+export const capacityStopWhen: StopCondition<ToolSet>[] = [
+  stepCountIs(10),
+  ({ steps }) => {
+    const last = steps[steps.length - 1];
+    const needsUser = last?.toolResults.some(
+      (r) =>
+        (r.output as { needsUserInput?: boolean } | undefined)
+          ?.needsUserInput === true
+    );
+    return Boolean(
+      okResult(last, "calculateCapex") ||
+      okResult(last, "submitRequest") ||
+      needsUser
+    );
+  }
+];
+
+/**
+ * Adds thousands separators to bare integers of 4+ digits in model text
+ * (1600 -> 1,600). Skips numbers that are part of IDs, codes, dates or
+ * decimals, e.g. APP-10234, CAP-0001, USDC1, 2026-11-25, 12.5.
+ */
+export function addThousandsSeparators(text: string) {
+  return text.replace(/(?<![\w.,\-/:#])\d{4,}(?![\w,]|[.\-/:]\d)/g, (digits) =>
+    Number(digits).toLocaleString("en-US")
+  );
+}
+
+/**
+ * Stream transform that (1) writes each tool's ready-to-show `display` block
+ * into the chat as assistant text right after the tool result, and
+ * (2) formats numbers in model-written text.
+ */
+export const displayTransform: StreamTextTransform<ToolSet> = () => {
+  let n = 0;
+  // After Approve or Reject, the outcome is handled before the model's first
+  // step, so stopWhen can't end the turn. The server shows a fixed message
+  // and drops any model text that follows it.
+  let silenced = false;
+  return new TransformStream({
+    transform(part, controller) {
+      if (
+        silenced &&
+        (part.type === "text-start" ||
+          part.type === "text-delta" ||
+          part.type === "text-end")
+      ) {
+        return;
+      }
+      if (part.type === "text-delta") {
+        controller.enqueue({
+          ...part,
+          text: addThousandsSeparators(part.text)
+        });
+        return;
+      }
+      controller.enqueue(part);
+      if (
+        part.type === "tool-output-denied" &&
+        part.toolName === "submitRequest"
+      ) {
+        const id = `display-${part.toolCallId}-${n++}`;
+        controller.enqueue({ type: "text-start", id });
+        controller.enqueue({
+          type: "text-delta",
+          id,
+          text: "Submission cancelled. Nothing was saved. What would you like to change?"
+        });
+        controller.enqueue({ type: "text-end", id });
+        silenced = true;
+      }
+      if (part.type === "tool-result") {
+        const output = part.output as
+          | { ok?: boolean; display?: unknown }
+          | undefined;
+        if (typeof output?.display === "string") {
+          const id = `display-${part.toolCallId}-${n++}`;
+          controller.enqueue({ type: "text-start", id });
+          controller.enqueue({ type: "text-delta", id, text: output.display });
+          controller.enqueue({ type: "text-end", id });
+        }
+        if (part.toolName === "submitRequest" && output?.ok === true) {
+          silenced = true;
+        }
+      }
+    }
+  });
+};
