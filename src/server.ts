@@ -1,15 +1,20 @@
-import { createWorkersAI } from "workers-ai-provider";
-import { callable, routeAgentRequest, type Schedule } from "agents";
-import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
+import { callable, routeAgentRequest } from "agents";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
 import {
   convertToModelMessages,
   pruneMessages,
   stepCountIs,
-  streamText,
-  tool
+  streamText
 } from "ai";
-import { z } from "zod";
+import { formatRequestId } from "./capacity";
+import {
+  SYSTEM_PROMPT,
+  createCapacityTools,
+  createModel,
+  type Conversation,
+  type Draft,
+  type DraftStore
+} from "./tools";
 
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
@@ -19,6 +24,35 @@ export class ChatAgent extends AIChatAgent<Env> {
   waitForMcpConnections = true;
 
   onStart() {
+    this.sql`CREATE TABLE IF NOT EXISTS capacity_requests (
+      seq INTEGER PRIMARY KEY,
+      request_id TEXT NOT NULL UNIQUE,
+      app_name TEXT NOT NULL,
+      owner TEXT NOT NULL,
+      environment TEXT NOT NULL,
+      region TEXT NOT NULL,
+      data_center TEXT NOT NULL,
+      total_cores INTEGER NOT NULL,
+      total_memory_gb REAL NOT NULL,
+      total_disk_tb REAL NOT NULL,
+      give_back_cores INTEGER NOT NULL,
+      net_cores INTEGER NOT NULL,
+      capex_before REAL NOT NULL,
+      capex_after REAL NOT NULL,
+      currency TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`;
+    // In-progress calculation results (single row). submitRequest saves
+    // these numbers rather than anything the model passes in.
+    this.sql`CREATE TABLE IF NOT EXISTS intake_draft (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      total_cores INTEGER NOT NULL,
+      total_memory_gb REAL NOT NULL,
+      total_disk_tb REAL NOT NULL,
+      give_back_cores INTEGER,
+      give_back_turn INTEGER
+    )`;
+
     // Configure OAuth popup behavior for MCP servers that require authentication
     this.mcp.configureOAuthCallback({
       customHandler: (result) => {
@@ -46,161 +80,96 @@ export class ChatAgent extends AIChatAgent<Env> {
     await this.removeMcpServer(serverId);
   }
 
+  private draftStore(): DraftStore {
+    return {
+      get: () => {
+        const [row] = this.sql<{
+          total_cores: number;
+          total_memory_gb: number;
+          total_disk_tb: number;
+          give_back_cores: number | null;
+          give_back_turn: number | null;
+        }>`SELECT total_cores, total_memory_gb, total_disk_tb, give_back_cores,
+                  give_back_turn
+           FROM intake_draft WHERE id = 1`;
+        if (!row) return null;
+        return {
+          totalCores: row.total_cores,
+          totalMemoryGB: row.total_memory_gb,
+          totalDiskTB: row.total_disk_tb,
+          giveBackCores: row.give_back_cores,
+          giveBackTurn: row.give_back_turn
+        } satisfies Draft;
+      },
+      set: (draft) => {
+        if (!draft) {
+          this.sql`DELETE FROM intake_draft`;
+          return;
+        }
+        this.sql`INSERT OR REPLACE INTO intake_draft
+          (id, total_cores, total_memory_gb, total_disk_tb, give_back_cores,
+           give_back_turn)
+          VALUES (1, ${draft.totalCores}, ${draft.totalMemoryGB},
+                  ${draft.totalDiskTB}, ${draft.giveBackCores},
+                  ${draft.giveBackTurn})`;
+      },
+      saveRequest: (record) => {
+        // Durable Objects are single-threaded, so MAX+1 is safe here.
+        const [{ next }] = this.sql<{ next: number }>`
+          SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM capacity_requests`;
+        const requestId = formatRequestId(next);
+        this.sql`INSERT INTO capacity_requests (
+          seq, request_id, app_name, owner, environment, region, data_center,
+          total_cores, total_memory_gb, total_disk_tb, give_back_cores,
+          net_cores, capex_before, capex_after, currency, created_at
+        ) VALUES (
+          ${next}, ${requestId}, ${record.appName}, ${record.owner},
+          ${record.environment}, ${record.region}, ${record.dataCenter},
+          ${record.totalCores}, ${record.totalMemoryGB}, ${record.totalDiskTB},
+          ${record.giveBackCores}, ${record.netCores}, ${record.capexBefore},
+          ${record.capexAfter}, ${record.currency}, ${record.createdAt}
+        )`;
+        return requestId;
+      }
+    };
+  }
+
+  private conversation(): Conversation {
+    const userMessages = () => this.messages.filter((m) => m.role === "user");
+    const textOf = (m: (typeof this.messages)[number]) =>
+      m.parts.map((p) => (p.type === "text" ? p.text : "")).join("\n");
+    return {
+      userTurns: () => userMessages().length,
+      userText: () => userMessages().map(textOf).join("\n"),
+      latestUserText: () => {
+        const all = userMessages();
+        return all.length ? textOf(all[all.length - 1]) : "";
+      }
+    };
+  }
+
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
-    const workersai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
-        sessionAffinity: this.sessionAffinity
-      }),
-      system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
-
-${getSchedulePrompt({ date: new Date() })}
-
-If the user asks to schedule a task, use the schedule tool to schedule the task.`,
-      // Prune old tool calls and reasoning to save tokens on long conversations
+      model: createModel(this.env.AI, this.sessionAffinity),
+      system: SYSTEM_PROMPT,
+      // Tool results are kept (not pruned) so the final summary can quote
+      // the exact numbers the tools computed earlier in the conversation.
       messages: pruneMessages({
         messages: await convertToModelMessages(this.messages),
-        toolCalls: "before-last-2-messages",
         reasoning: "before-last-message"
       }),
       tools: {
         // MCP tools from connected servers
         ...mcpTools,
-
-        // Server-side tool: runs automatically on the server
-        getWeather: tool({
-          description: "Get the current weather for a city",
-          inputSchema: z.object({
-            city: z.string().describe("City name")
-          }),
-          execute: async ({ city }) => {
-            // Replace with a real weather API in production
-            const conditions = ["sunny", "cloudy", "rainy", "snowy"];
-            const temp = Math.floor(Math.random() * 30) + 5;
-            return {
-              city,
-              temperature: temp,
-              condition:
-                conditions[Math.floor(Math.random() * conditions.length)],
-              unit: "celsius"
-            };
-          }
-        }),
-
-        // Client-side tool: no execute function — the browser handles it
-        getUserTimezone: tool({
-          description:
-            "Get the user's timezone from their browser. Use this when you need to know the user's local time.",
-          inputSchema: z.object({})
-        }),
-
-        // Approval tool: requires user confirmation before executing
-        calculate: tool({
-          description:
-            "Perform a math calculation with two numbers. Requires user approval for large numbers.",
-          inputSchema: z.object({
-            a: z.number().describe("First number"),
-            b: z.number().describe("Second number"),
-            operator: z
-              .enum(["+", "-", "*", "/", "%"])
-              .describe("Arithmetic operator")
-          }),
-          needsApproval: async ({ a, b }) =>
-            Math.abs(a) > 1000 || Math.abs(b) > 1000,
-          execute: async ({ a, b, operator }) => {
-            const ops: Record<string, (x: number, y: number) => number> = {
-              "+": (x, y) => x + y,
-              "-": (x, y) => x - y,
-              "*": (x, y) => x * y,
-              "/": (x, y) => x / y,
-              "%": (x, y) => x % y
-            };
-            if (operator === "/" && b === 0) {
-              return { error: "Division by zero" };
-            }
-            return {
-              expression: `${a} ${operator} ${b}`,
-              result: ops[operator](a, b)
-            };
-          }
-        }),
-
-        scheduleTask: tool({
-          description:
-            "Schedule a task to be executed at a later time. Use this when the user asks to be reminded or wants something done later.",
-          inputSchema: scheduleSchema,
-          execute: async ({ when, description }) => {
-            if (when.type === "no-schedule") {
-              return "Not a valid schedule input";
-            }
-            const input =
-              when.type === "scheduled"
-                ? when.date
-                : when.type === "delayed"
-                  ? when.delayInSeconds
-                  : when.type === "cron"
-                    ? when.cron
-                    : null;
-            if (!input) return "Invalid schedule type";
-            try {
-              this.schedule(input, "executeTask", description, {
-                idempotent: true
-              });
-              return `Task scheduled: "${description}" (${when.type}: ${input})`;
-            } catch (error) {
-              return `Error scheduling task: ${error}`;
-            }
-          }
-        }),
-
-        getScheduledTasks: tool({
-          description: "List all tasks that have been scheduled",
-          inputSchema: z.object({}),
-          execute: async () => {
-            const tasks = this.getSchedules();
-            return tasks.length > 0 ? tasks : "No scheduled tasks found.";
-          }
-        }),
-
-        cancelScheduledTask: tool({
-          description: "Cancel a scheduled task by its ID",
-          inputSchema: z.object({
-            taskId: z.string().describe("The ID of the task to cancel")
-          }),
-          execute: async ({ taskId }) => {
-            try {
-              this.cancelSchedule(taskId);
-              return `Task ${taskId} cancelled.`;
-            } catch (error) {
-              return `Error cancelling task: ${error}`;
-            }
-          }
-        })
+        ...createCapacityTools(this.draftStore(), this.conversation())
       },
-      stopWhen: stepCountIs(20),
+      stopWhen: stepCountIs(10),
       abortSignal: options?.abortSignal
     });
 
     return result.toUIMessageStreamResponse();
-  }
-
-  async executeTask(description: string, _task: Schedule<string>) {
-    // Do the actual work here (send email, call API, etc.)
-    console.log(`Executing scheduled task: ${description}`);
-
-    // Notify connected clients via a broadcast event.
-    // We use broadcast() instead of saveMessages() to avoid injecting
-    // into chat history — that would cause the AI to see the notification
-    // as new context and potentially loop.
-    this.broadcast(
-      JSON.stringify({
-        type: "scheduled-task",
-        description,
-        timestamp: new Date().toISOString()
-      })
-    );
   }
 }
 

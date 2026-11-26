@@ -1,0 +1,10 @@
+{
+  "currency": "USD",
+  "perCore": 500,
+  "note": "Sample rate and data centers for demo only",
+  "regions": {
+    "Americas": ["USDC1", "USDC2"],
+    "EMEA": ["EUDC1", "EUDC2"],
+    "APAC": ["ASDC1", "ASDC2"]
+  }
+}
